@@ -1,0 +1,575 @@
+Option Explicit
+Sub RunFullPipeline()
+    Dim imported As Boolean
+    imported = ImportRawData()
+    If Not imported Then Exit Sub
+
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+
+    Call CleanAndValidateData
+    Call ComputeResponseTimeBuckets
+    Call BuildTabulations
+    Call BuildCharts
+    Call BuildDailyTrendChart
+    Call BuildSummaryReport
+
+    Application.DisplayAlerts = True
+    Application.ScreenUpdating = True
+
+End Sub
+
+' STEP 1: IMPORT RAW DATA
+' Browse for a CSV file and loads it into the RawData sheet
+
+Function ImportRawData() As Boolean
+    Dim filePath As Variant
+    Dim wsRaw As Worksheet
+    Dim wbSource As Workbook
+    Dim wsSource As Worksheet
+    Dim lastCol As Long
+
+    filePath = Application.GetOpenFilename( _
+        FileFilter:="CSV Files (*.csv), *.csv", _
+        title:="Select the raw data CSV file to import")
+
+    If filePath = False Then
+        MsgBox "Import cancelled - no file selected.", vbExclamation
+        ImportRawData = False
+        Exit Function
+    End If
+
+    Application.ScreenUpdating = False
+
+    Set wsRaw = ThisWorkbook.Sheets("RawData")
+    wsRaw.UsedRange.Delete
+
+    Set wbSource = Workbooks.Open(filePath)
+    Set wsSource = wbSource.Sheets(1)
+    wsSource.UsedRange.Copy Destination:=wsRaw.Range("A1")
+    wbSource.Close SaveChanges:=False
+
+    ' Re-apply header formatting since Clear wiped it out
+    lastCol = wsRaw.Cells(1, wsRaw.Columns.Count).End(xlToLeft).Column
+    With wsRaw.Range(wsRaw.Cells(1, 1), wsRaw.Cells(1, lastCol))
+        .Font.Bold = True
+        .Font.Color = RGB(255, 255, 255)
+        .Interior.Color = RGB(48, 84, 150)
+        .HorizontalAlignment = xlCenter
+    End With
+    wsRaw.Columns.AutoFit
+    wsRaw.Activate
+    wsRaw.Range("A2").Select
+    ActiveWindow.FreezePanes = True
+
+    Application.ScreenUpdating = True
+    ImportRawData = True
+End Function
+
+' STEP 2: DATA CLEANING & VALIDATION
+' Flags rows with missing Order_id and trims whitespace on text fields
+' The data-quality numbers will be reported on the Summary sheet
+
+Sub CleanAndValidateData()
+    Dim wsRaw As Worksheet
+    Dim lastRow As Long, lastCol As Long, i As Long, c As Long
+    Dim flagCol As Long
+
+    Set wsRaw = ThisWorkbook.Sheets("RawData")
+    lastRow = wsRaw.Cells(wsRaw.Rows.Count, 1).End(xlUp).Row
+    lastCol = wsRaw.Cells(1, wsRaw.Columns.Count).End(xlToLeft).Column
+
+    ' Add a DataQualityFlag column at the end if it doesn't already exist
+    If wsRaw.Cells(1, lastCol).Value <> "DataQualityFlag" Then
+        flagCol = lastCol + 1
+        wsRaw.Cells(1, flagCol).Value = "DataQualityFlag"
+    Else
+        flagCol = lastCol
+    End If
+
+    ' Find the Order_id column dynamically
+    Dim orderCol As Long
+    orderCol = 0
+    For c = 1 To lastCol
+        If wsRaw.Cells(1, c).Value = "Order_id" Then orderCol = c
+    Next c
+
+    For i = 2 To lastRow
+        ' Trim whitespace on text cells
+        For c = 1 To lastCol
+            If VarType(wsRaw.Cells(i, c).Value) = vbString Then
+                wsRaw.Cells(i, c).Value = Trim(wsRaw.Cells(i, c).Value)
+            End If
+        Next c
+
+        ' Flag missing Order_id
+        If orderCol > 0 Then
+            If Trim(wsRaw.Cells(i, orderCol).Value) = "" Then
+                wsRaw.Cells(i, flagCol).Value = "Missing Order ID"
+            Else
+                wsRaw.Cells(i, flagCol).Value = "OK"
+            End If
+        End If
+    Next i
+End Sub
+
+' STEP 2B: RESPONSE TIME CALCULATION
+' Calculates how long each ticket took to get a response (from
+' Issue_reported at to issue_responded) and buckets it, so we can
+' check whether slower responses correlate with lower CSAT
+'
+' Dates in this file are DD/MM/YYYY HH:MM - parsed manually (not via
+' CDate) because CDate's interpretation depends on the system's
+' regional settings and could silently swap day/month on some machines
+
+Sub ComputeResponseTimeBuckets()
+    Dim wsRaw As Worksheet
+    Dim lastRow As Long, lastCol As Long, i As Long
+    Dim colReported As Long, colResponded As Long, colHours As Long, colBucket As Long
+    Dim reportedVal As Variant, respondedVal As Variant
+    Dim diffHours As Double
+ 
+    Set wsRaw = ThisWorkbook.Sheets("RawData")
+    lastRow = wsRaw.Cells(wsRaw.Rows.Count, 1).End(xlUp).Row
+    lastCol = wsRaw.Cells(1, wsRaw.Columns.Count).End(xlToLeft).Column
+ 
+    colReported = FindColumn(wsRaw, "Issue_reported at")
+    colResponded = FindColumn(wsRaw, "issue_responded")
+    If colReported = 0 Or colResponded = 0 Then Exit Sub
+ 
+    colHours = FindColumn(wsRaw, "ResponseTimeHours")
+    If colHours = 0 Then
+        colHours = lastCol + 1
+        wsRaw.Cells(1, colHours).Value = "ResponseTimeHours"
+    End If
+    colBucket = FindColumn(wsRaw, "ResponseTimeBucket")
+    If colBucket = 0 Then
+        colBucket = colHours + 1
+        wsRaw.Cells(1, colBucket).Value = "ResponseTimeBucket"
+    End If
+ 
+    For i = 2 To lastRow
+        reportedVal = ParseDDMMYYYY(wsRaw.Cells(i, colReported).Value)
+        respondedVal = ParseDDMMYYYY(wsRaw.Cells(i, colResponded).Value)
+ 
+        If IsNull(reportedVal) Or IsNull(respondedVal) Then
+            wsRaw.Cells(i, colHours).Value = ""
+            wsRaw.Cells(i, colBucket).Value = "Invalid/Missing"
+        Else
+            diffHours = (CDbl(respondedVal) - CDbl(reportedVal)) * 24
+            If diffHours < 0 Then
+                wsRaw.Cells(i, colHours).Value = ""
+                wsRaw.Cells(i, colBucket).Value = "Invalid/Missing"
+            Else
+                wsRaw.Cells(i, colHours).Value = Round(diffHours, 2)
+                Select Case diffHours
+                    Case Is < 1
+                        wsRaw.Cells(i, colBucket).Value = "Under 1 hr"
+                    Case Is < 4
+                        wsRaw.Cells(i, colBucket).Value = "1-4 hrs"
+                    Case Is < 24
+                        wsRaw.Cells(i, colBucket).Value = "4-24 hrs"
+                    Case Else
+                        wsRaw.Cells(i, colBucket).Value = "Over 24 hrs"
+                End Select
+            End If
+        End If
+    Next i
+End Sub
+ 
+' Helper: returns a real Date value from either:
+'   (a) a cell Excel already auto-converted to a Date during CSV import
+'       (this is what usually happens - Excel detects date-looking text
+'       and converts it before our code ever sees it), or
+'   (b) a plain "DD/MM/YYYY HH:MM" text string, parsed manually without
+'       relying on CDate (which can misread day/month depending on the
+'       system's regional settings)
+' Returns Null if neither case applies
+
+Function ParseDDMMYYYY(ByVal cellValue As Variant) As Variant
+    On Error GoTo Fail
+ 
+    ' Case 1: Excel already converted this to a real date/time value
+    If VarType(cellValue) = vbDate Then
+        ParseDDMMYYYY = CDate(cellValue)
+        Exit Function
+    End If
+ 
+    ' Case 2: still plain text - parse "DD/MM/YYYY HH:MM" manually
+    Dim s As String
+    s = Trim(CStr(cellValue))
+    If s = "" Then GoTo Fail
+ 
+    Dim parts() As String, dParts() As String, tParts() As String
+    Dim d As Integer, m As Integer, y As Integer, hh As Integer, mm As Integer
+ 
+    parts = Split(s, " ")
+    dParts = Split(parts(0), "/")
+    d = CInt(dParts(0))
+    m = CInt(dParts(1))
+    y = CInt(dParts(2))
+ 
+    hh = 0: mm = 0
+    If UBound(parts) >= 1 Then
+        tParts = Split(parts(1), ":")
+        hh = CInt(tParts(0))
+        mm = CInt(tParts(1))
+    End If
+ 
+    ParseDDMMYYYY = DateSerial(y, m, d) + TimeSerial(hh, mm, 0)
+    Exit Function
+ 
+Fail:
+    ParseDDMMYYYY = Null
+End Function
+
+' STEP 3: TABULATION
+' Builds cross-tab tables (CSAT average + response count) by
+' Category, Agent Shift, and Tenure Bucket using dynamic formulas
+' that recalculate automatically if RawData changes.
+
+Sub BuildTabulations()
+    Dim wsRaw As Worksheet, wsTab As Worksheet
+    Dim lastRow As Long
+    Dim colCategory As Long, colShift As Long, colTenure As Long, colCSAT As Long
+    Dim colRTBucket As Long
+
+    Set wsRaw = ThisWorkbook.Sheets("RawData")
+    lastRow = wsRaw.Cells(wsRaw.Rows.Count, 1).End(xlUp).Row
+
+    colCategory = FindColumn(wsRaw, "category")
+    colShift = FindColumn(wsRaw, "Agent Shift")
+    colTenure = FindColumn(wsRaw, "Tenure Bucket")
+    colRTBucket = FindColumn(wsRaw, "ResponseTimeBucket")
+    colCSAT = FindColumn(wsRaw, "CSAT Score")
+
+    If SheetExists("Tabulations") Then
+        Set wsTab = ThisWorkbook.Sheets("Tabulations")
+        wsTab.Cells.Clear
+    Else
+        Set wsTab = ThisWorkbook.Sheets.Add(After:=wsRaw)
+        wsTab.Name = "Tabulations"
+    End If
+
+    Dim startRow As Long
+    startRow = 1
+    startRow = BuildOneCrossTab(wsRaw, wsTab, lastRow, colCategory, colCSAT, "CSAT by Category", startRow)
+    startRow = BuildOneCrossTab(wsRaw, wsTab, lastRow, colShift, colCSAT, "CSAT by Agent Shift", startRow)
+    startRow = BuildOneCrossTab(wsRaw, wsTab, lastRow, colTenure, colCSAT, "CSAT by Tenure Bucket", startRow)
+    If colRTBucket > 0 Then
+        startRow = BuildOneCrossTab(wsRaw, wsTab, lastRow, colRTBucket, colCSAT, "CSAT by Response Time", startRow)
+    End If
+
+    wsTab.Columns("A:C").AutoFit
+End Sub
+
+' Helper: builds one cross-tab block (unique values x Avg CSAT x Count)
+' starting at the given row, and returns the next free row
+
+Function BuildOneCrossTab(wsRaw As Worksheet, wsTab As Worksheet, lastRow As Long, _
+                          dimCol As Long, csatCol As Long, title As String, startRow As Long) As Long
+    Dim dimColLetter As String, csatColLetter As String
+    Dim uniqueVals As Collection
+    Dim v As Variant, r As Long
+
+    dimColLetter = Split(wsRaw.Cells(1, dimCol).Address, "$")(1)
+    csatColLetter = Split(wsRaw.Cells(1, csatCol).Address, "$")(1)
+
+    Set uniqueVals = New Collection
+    On Error Resume Next
+    For r = 2 To lastRow
+        uniqueVals.Add wsRaw.Cells(r, dimCol).Value, CStr(wsRaw.Cells(r, dimCol).Value)
+    Next r
+    On Error GoTo 0
+
+    wsTab.Cells(startRow, 1).Value = title
+    wsTab.Cells(startRow, 1).Font.Bold = True
+    wsTab.Cells(startRow + 1, 1).Value = "Value"
+    wsTab.Cells(startRow + 1, 2).Value = "Avg CSAT"
+    wsTab.Cells(startRow + 1, 3).Value = "Response Count"
+    wsTab.Range(wsTab.Cells(startRow + 1, 1), wsTab.Cells(startRow + 1, 3)).Font.Bold = True
+
+    Dim i As Long
+    i = 0
+    For Each v In uniqueVals
+        wsTab.Cells(startRow + 2 + i, 1).Value = v
+        wsTab.Cells(startRow + 2 + i, 2).Formula = _
+            "=AVERAGEIF(RawData!" & dimColLetter & "2:" & dimColLetter & lastRow & _
+            ",""=""&A" & (startRow + 2 + i) & ",RawData!" & csatColLetter & "2:" & csatColLetter & lastRow & ")"
+        wsTab.Cells(startRow + 2 + i, 2).NumberFormat = "0.00"
+        wsTab.Cells(startRow + 2 + i, 3).Formula = _
+            "=COUNTIF(RawData!" & dimColLetter & "2:" & dimColLetter & lastRow & _
+            ",""=""&A" & (startRow + 2 + i) & ")"
+        i = i + 1
+    Next v
+
+    ' Sort this block's data rows by Avg CSAT, highest first, so the
+    ' best/worst performing values are immediately visible rather than
+    ' appearing in whatever order they were first encountered in RawData
+    If i > 1 Then
+        wsTab.Range(wsTab.Cells(startRow + 2, 1), wsTab.Cells(startRow + 2 + i - 1, 3)).Sort _
+            Key1:=wsTab.Cells(startRow + 2, 2), Order1:=xlDescending, Header:=xlNo
+    End If
+
+    BuildOneCrossTab = startRow + 2 + i + 2 ' leave a blank row gap before next block
+End Function
+
+' STEP 4: AUTO-CHARTING
+' Builds a bar chart for each cross-tab block on the Tabulations sheet
+
+Sub BuildCharts()
+    Dim wsTab As Worksheet
+    Dim cht As ChartObject
+    Dim titles As Variant, i As Long
+    Dim foundRow As Long
+
+    Set wsTab = ThisWorkbook.Sheets("Tabulations")
+
+    ' Remove any existing charts before rebuilding
+    For Each cht In wsTab.ChartObjects
+        cht.Delete
+    Next cht
+
+    titles = Array("CSAT by Category", "CSAT by Agent Shift", "CSAT by Tenure Bucket", _
+                   "CSAT by Response Time")
+
+    Dim topPos As Double
+    topPos = 10
+
+    For i = 0 To UBound(titles)
+        foundRow = FindRowByValue(wsTab, titles(i))
+        If foundRow > 0 Then
+            Dim dataStart As Long, dataEnd As Long
+            dataStart = foundRow + 2
+            dataEnd = dataStart
+            Do While wsTab.Cells(dataEnd, 1).Value <> ""
+                dataEnd = dataEnd + 1
+            Loop
+            dataEnd = dataEnd - 1
+
+            Set cht = wsTab.ChartObjects.Add(Left:=350, Top:=topPos, Width:=500, Height:=220)
+            With cht.Chart
+                .SetSourceData Source:=wsTab.Range(wsTab.Cells(dataStart, 1), wsTab.Cells(dataEnd, 2))
+                .ChartType = xlColumnClustered
+                .HasTitle = True
+                .ChartTitle.Text = titles(i)
+                .SeriesCollection(1).Name = "Avg CSAT"
+                .SeriesCollection(1).HasDataLabels = True
+                .SeriesCollection(1).DataLabels.NumberFormat = "0.00"
+
+                Dim srsCount As Series
+                Set srsCount = .SeriesCollection.NewSeries
+                srsCount.Name = "Response Count"
+                srsCount.Values = wsTab.Range(wsTab.Cells(dataStart, 3), wsTab.Cells(dataEnd, 3))
+                srsCount.XValues = wsTab.Range(wsTab.Cells(dataStart, 1), wsTab.Cells(dataEnd, 1))
+                srsCount.ChartType = xlLine
+                srsCount.AxisGroup = xlSecondary
+
+                .HasLegend = True
+            End With
+            topPos = topPos + 240
+        End If
+    Next i
+End Sub
+
+' STEP 4B: CSAT BY DAY (trend chart)
+
+Sub BuildDailyTrendChart()
+    Dim wsRaw As Worksheet, wsTrend As Worksheet
+    Dim lastRow As Long, colDate As Long, colCSAT As Long
+    Dim dateColLetter As String, csatColLetter As String
+    Dim uniqueDates As Collection
+    Dim r As Long, i As Long, j As Long
+    Dim dateKey As String
+
+    Set wsRaw = ThisWorkbook.Sheets("RawData")
+    lastRow = wsRaw.Cells(wsRaw.Rows.Count, 1).End(xlUp).Row
+    colDate = FindColumn(wsRaw, "Survey_response_Date")
+    colCSAT = FindColumn(wsRaw, "CSAT Score")
+
+    If colDate = 0 Then
+        MsgBox "Couldn't find a 'Survey_response_Date' column - skipping trend chart."
+        Exit Sub
+    End If
+
+    dateColLetter = Split(wsRaw.Cells(1, colDate).Address, "$")(1)
+    csatColLetter = Split(wsRaw.Cells(1, colCSAT).Address, "$")(1)
+
+    ' Collect unique day-only date keys (drops any time-of-day component)
+    Set uniqueDates = New Collection
+    On Error Resume Next
+    For r = 2 To lastRow
+        If IsDate(wsRaw.Cells(r, colDate).Value) Then
+            dateKey = Format(CDate(wsRaw.Cells(r, colDate).Value), "yyyy-mm-dd")
+            uniqueDates.Add dateKey, dateKey
+        End If
+    Next r
+    On Error GoTo 0
+
+    ' Move to a plain array and sort ascending (yyyy-mm-dd sorts as text)
+    Dim sortedDates() As String
+    ReDim sortedDates(1 To uniqueDates.Count)
+    For i = 1 To uniqueDates.Count
+        sortedDates(i) = uniqueDates(i)
+    Next i
+    Dim temp As String
+    For i = 1 To UBound(sortedDates) - 1
+        For j = i + 1 To UBound(sortedDates)
+            If sortedDates(j) < sortedDates(i) Then
+                temp = sortedDates(i)
+                sortedDates(i) = sortedDates(j)
+                sortedDates(j) = temp
+            End If
+        Next j
+    Next i
+
+    If SheetExists("DailyTrend") Then
+        Set wsTrend = ThisWorkbook.Sheets("DailyTrend")
+        wsTrend.Cells.Clear
+    Else
+        Set wsTrend = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets("RawData"))
+        wsTrend.Name = "DailyTrend"
+    End If
+
+    wsTrend.Range("A1").Value = "Date"
+    wsTrend.Range("B1").Value = "Avg CSAT"
+    wsTrend.Range("C1").Value = "Response Count"
+    wsTrend.Range("A1:C1").Font.Bold = True
+
+    Dim rowOut As Long
+    rowOut = 2
+    For i = 1 To UBound(sortedDates)
+        wsTrend.Cells(rowOut, 1).Value = CDate(sortedDates(i))
+        wsTrend.Cells(rowOut, 1).NumberFormat = "yyyy-mm-dd"
+
+        wsTrend.Cells(rowOut, 2).Formula = _
+            "=AVERAGEIFS(RawData!" & csatColLetter & "2:" & csatColLetter & lastRow & _
+            ",RawData!" & dateColLetter & "2:" & dateColLetter & lastRow & ","">=""&A" & rowOut & _
+            ",RawData!" & dateColLetter & "2:" & dateColLetter & lastRow & ",""<""&(A" & rowOut & "+1))"
+        wsTrend.Cells(rowOut, 2).NumberFormat = "0.00"
+
+        wsTrend.Cells(rowOut, 3).Formula = _
+            "=COUNTIFS(RawData!" & dateColLetter & "2:" & dateColLetter & lastRow & ","">=""&A" & rowOut & _
+            ",RawData!" & dateColLetter & "2:" & dateColLetter & lastRow & ",""<""&(A" & rowOut & "+1))"
+
+        rowOut = rowOut + 1
+    Next i
+
+    wsTrend.Columns("A:C").AutoFit
+
+    ' Trend line chart
+    Dim cht As ChartObject
+    For Each cht In wsTrend.ChartObjects
+        cht.Delete
+    Next cht
+
+    If rowOut > 2 Then
+        Set cht = wsTrend.ChartObjects.Add(Left:=350, Top:=10, Width:=450, Height:=250)
+        With cht.Chart
+            .SetSourceData Source:=wsTrend.Range(wsTrend.Cells(1, 1), wsTrend.Cells(rowOut - 1, 2))
+            .ChartType = xlLine
+            .HasTitle = True
+            .ChartTitle.Text = "Average CSAT Trend Over Time"
+            .SeriesCollection(1).Name = "Avg CSAT"
+
+            Dim srsVol As Series
+            Set srsVol = .SeriesCollection.NewSeries
+            srsVol.Name = "Response Count"
+            srsVol.Values = wsTrend.Range(wsTrend.Cells(2, 3), wsTrend.Cells(rowOut - 1, 3))
+            srsVol.XValues = wsTrend.Range(wsTrend.Cells(2, 1), wsTrend.Cells(rowOut - 1, 1))
+            srsVol.ChartType = xlColumnClustered
+            srsVol.AxisGroup = xlSecondary
+
+            .HasLegend = True
+        End With
+    End If
+End Sub
+
+' STEP 5: SUMMARY / TOPLINE REPORT
+
+Sub BuildSummaryReport()
+    Dim wsRaw As Worksheet, wsSum As Worksheet
+    Dim lastRow As Long, colCSAT As Long, csatColLetter As String
+    Dim colFlag As Long, flagColLetter As String
+
+    Set wsRaw = ThisWorkbook.Sheets("RawData")
+    lastRow = wsRaw.Cells(wsRaw.Rows.Count, 1).End(xlUp).Row
+    colCSAT = FindColumn(wsRaw, "CSAT Score")
+    csatColLetter = Split(wsRaw.Cells(1, colCSAT).Address, "$")(1)
+    colFlag = FindColumn(wsRaw, "DataQualityFlag")
+
+    If SheetExists("Summary") Then
+        Set wsSum = ThisWorkbook.Sheets("Summary")
+        wsSum.Cells.Clear
+    Else
+        Set wsSum = ThisWorkbook.Sheets.Add(Before:=wsRaw)
+        wsSum.Name = "Summary"
+    End If
+
+    wsSum.Range("A1").Value = "CSAT Topline Report"
+    wsSum.Range("A1").Font.Size = 14
+    wsSum.Range("A1").Font.Bold = True
+    wsSum.Range("A3").Value = "Total responses:"
+    wsSum.Range("B3").Formula = "=COUNT(RawData!" & csatColLetter & "2:" & csatColLetter & lastRow & ")"
+    wsSum.Range("A4").Value = "Overall average CSAT:"
+    wsSum.Range("B4").Formula = "=AVERAGE(RawData!" & csatColLetter & "2:" & csatColLetter & lastRow & ")"
+    wsSum.Range("B4").NumberFormat = "0.00"
+    wsSum.Range("A5").Value = "% Satisfied (score 4-5):"
+    wsSum.Range("B5").Formula = "=COUNTIFS(RawData!" & csatColLetter & "2:" & csatColLetter & lastRow & _
+        ","">=4"")/B3"
+    wsSum.Range("B5").NumberFormat = "0.0%"
+    wsSum.Range("A6").Value = "Report generated:"
+    wsSum.Range("B6").Value = Now
+
+    ' Data quality section
+    wsSum.Range("A8").Value = "Data Quality"
+    wsSum.Range("A8").Font.Bold = True
+    If colFlag > 0 Then
+        flagColLetter = Split(wsRaw.Cells(1, colFlag).Address, "$")(1)
+        wsSum.Range("A9").Value = "Records missing Order ID:"
+        wsSum.Range("B9").Formula = "=COUNTIF(RawData!" & flagColLetter & "2:" & flagColLetter & lastRow & _
+            ",""Missing Order ID"")"
+        wsSum.Range("A10").Value = "Data completeness (Order ID):"
+        wsSum.Range("B10").Formula = "=1-(B9/B3)"
+        wsSum.Range("B10").NumberFormat = "0.0%"
+    Else
+        wsSum.Range("A9").Value = "(Run CleanAndValidateData first to populate this section)"
+    End If
+
+    wsSum.Columns("A:B").AutoFit
+    wsSum.Activate
+End Sub
+
+' HELPER FUNCTIONS
+Function FindColumn(ws As Worksheet, headerName As String) As Long
+    Dim lastCol As Long, c As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    For c = 1 To lastCol
+        If ws.Cells(1, c).Value = headerName Then
+            FindColumn = c
+            Exit Function
+        End If
+    Next c
+    FindColumn = 0
+End Function
+
+Function FindRowByValue(ws As Worksheet, ByVal val As String) As Long
+    Dim lastRow As Long, r As Long
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    For r = 1 To lastRow
+        If ws.Cells(r, 1).Value = val Then
+            FindRowByValue = r
+            Exit Function
+        End If
+    Next r
+    FindRowByValue = 0
+End Function
+
+Function SheetExists(sheetName As String) As Boolean
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = ThisWorkbook.Sheets(sheetName)
+    On Error GoTo 0
+    SheetExists = Not ws Is Nothing
+End Function
+
