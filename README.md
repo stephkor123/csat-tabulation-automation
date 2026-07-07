@@ -1,10 +1,10 @@
 # CSAT Tabulation & Reporting Automation (VBA)
 
 ## Problem
-Customer support teams collect large volumes of raw survey/ticket data (85,000+ records in the source dataset), but raw data alone isn't useful without regular tabulation, quality checks, and reporting — a manual process that's slow and error-prone if repeated every reporting cycle.
+Customer support teams collect large volumes of raw survey/ticket data (85,000+ records in the source dataset), but raw data alone isn't useful without regular tabulation, quality checks, and reporting. A manual process that's slow and error-prone if repeated every reporting cycle.
 
 ## Approach
-Built a fully macro-driven Excel pipeline that takes raw CSAT (Customer Satisfaction) survey data and automatically produces a cleaned, validated, tabulated, and charted topline report — no manual pivot-table building required.
+Built a fully macro-driven Excel pipeline that takes raw CSAT (Customer Satisfaction) survey data and automatically produces a cleaned, validated, tabulated, and charted topline report. There is no manual pivot-table building required.
 
 **Pipeline steps (all VBA-driven, run with one click via `RunFullPipeline`):**
 1. **Import** — browse for the raw CSV and load it into RawData
@@ -13,7 +13,8 @@ Built a fully macro-driven Excel pipeline that takes raw CSAT (Customer Satisfac
 4. **Daily trend** — CSAT trend over time plus daily response volume, on its own sheet
 5. **Topline summary** — key metrics (total responses, average CSAT, % satisfied) plus a data-quality section, auto-generated on a Summary sheet
 
-All formulas and charts rebuild automatically if the raw data changes — this isn't a one-time analysis, it's a repeatable reporting tool.
+All formulas and charts rebuild automatically if the raw data changes. 
+This isn't a one-time analysis; it's a repeatable reporting tool.
 
 ## Tools
 VBA, Microsoft Excel
@@ -33,8 +34,3 @@ Full [eCommerce Customer Service Satisfaction dataset](https://www.kaggle.com/da
 3. Browse for the raw CSV when prompted
 
 (`VBA_Macros.txt` is included in this repo as a readable reference to the full macro code, in case you'd rather review it without opening Excel.)
-
-## What I'd do next
-- Expand tabulation to include channel_name and Sub-category
-- Add conditional formatting to flag categories/buckets below a CSAT threshold
-- Add a Supervisor-level rollup as a more statistically robust alternative to individual agent-level performance views
